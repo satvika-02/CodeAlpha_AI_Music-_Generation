@@ -1,0 +1,457 @@
+"""
+music_ai.py  -  Music Generation with AI (LSTM) in a single file
+
+Steps
+  1. Collect MIDI files            -> put .mid files in  data/midi/
+  2. Preprocess with music21       -> notes/chords become text tokens like "C4:1" or "60.64.67:2"
+  3. Build an LSTM model           -> predicts the next token
+  4. Train                         -> python music_ai.py train
+  5. Generate MIDI / audio         -> python music_ai.py generate
+
+Commands
+  python music_ai.py demo-data                      create small test MIDI files (no download needed)
+  python music_ai.py train --epochs 50
+  python music_ai.py generate --length 300 --temperature 0.9 --play
+  python music_ai.py generate --audio --soundfont path/to/file.sf2
+"""
+
+import argparse
+import json
+import pickle
+import random
+import re
+import time
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+
+# =====================================================================
+# CONFIG
+# =====================================================================
+BASE_DIR = Path(__file__).resolve().parent
+MIDI_DIR = BASE_DIR / "data" / "midi"
+PROCESSED_DIR = BASE_DIR / "data" / "processed"
+MODEL_DIR = BASE_DIR / "models"
+OUTPUT_DIR = BASE_DIR / "output"
+
+TOKENS_FILE = PROCESSED_DIR / "tokens.pkl"
+VOCAB_FILE = PROCESSED_DIR / "vocab.json"
+MODEL_FILE = MODEL_DIR / "music_lstm.keras"
+BEST_MODEL_FILE = MODEL_DIR / "best_model.keras"
+HISTORY_PLOT = MODEL_DIR / "training_history.png"
+
+# Preprocessing
+SEQUENCE_LENGTH = 40         # previous tokens the model looks at
+TRANSPOSE_TO_C = True        # transpose songs to C major / A minor
+USE_CHORDIFY = True          # merge simultaneous notes into chords
+MAX_CHORD_NOTES = 4
+MAX_TOKENS_PER_FILE = 4000
+MIN_TOKEN_COUNT = 3          # drop very rare tokens
+DURATIONS = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]   # in quarter notes
+
+# Model
+EMBED_DIM = 128
+LSTM_UNITS = 256
+DROPOUT = 0.3
+LEARNING_RATE = 1e-3
+
+# Training
+EPOCHS = 50
+BATCH_SIZE = 128
+VALIDATION_SPLIT = 0.1
+RANDOM_SEED = 42
+
+# Generation
+DEFAULT_LENGTH = 200
+DEFAULT_TEMPERATURE = 1.0
+DEFAULT_BPM = 100
+
+
+def ensure_dirs():
+    for folder in (MIDI_DIR, PROCESSED_DIR, MODEL_DIR, OUTPUT_DIR):
+        folder.mkdir(parents=True, exist_ok=True)
+
+
+# =====================================================================
+# 1. DATA COLLECTION (demo data so you can test without downloading)
+# =====================================================================
+def make_demo_data(num_files=30, notes_per_file=300):
+    """Create simple melodies in C major so the whole pipeline can be tested.
+    For real results, use real classical/jazz MIDI files instead."""
+    from music21 import note, stream
+
+    ensure_dirs()
+    scale = [60, 62, 64, 65, 67, 69, 71, 72]                 # C major, MIDI numbers
+    lengths = [0.5, 0.5, 1.0, 1.0, 2.0]
+    for n in range(num_files):
+        s = stream.Stream()
+        idx = random.randint(0, len(scale) - 1)
+        for _ in range(notes_per_file):
+            idx = min(max(idx + random.choice([-2, -1, -1, 0, 1, 1, 2]), 0), len(scale) - 1)
+            s.append(note.Note(scale[idx], quarterLength=random.choice(lengths)))
+        s.write("midi", fp=str(MIDI_DIR / f"demo_{n + 1:02d}.mid"))
+    print(f"Created {num_files} demo MIDI files in {MIDI_DIR}")
+
+
+# =====================================================================
+# 2. PREPROCESSING (music21)
+# =====================================================================
+def find_midi_files(folder):
+    return sorted(p for p in Path(folder).rglob("*") if p.suffix.lower() in (".mid", ".midi"))
+
+
+def quantize_duration(quarter_length):
+    return min(DURATIONS, key=lambda d: abs(d - quarter_length))
+
+
+def element_to_token(element):
+    """Convert a music21 Note/Chord into a token such as 'C4:1' or '60.64.67:2'."""
+    from music21 import chord, note, pitch
+
+    ql = float(element.duration.quarterLength)
+    if ql <= 0:
+        return None
+    duration = quantize_duration(ql)
+
+    if isinstance(element, note.Note):
+        name = element.pitch.nameWithOctave
+    elif isinstance(element, chord.Chord):
+        midis = sorted({p.midi for p in element.pitches})[:MAX_CHORD_NOTES]
+        name = pitch.Pitch(midis[0]).nameWithOctave if len(midis) == 1 \
+            else ".".join(str(m) for m in midis)
+    else:
+        return None
+    return f"{name}:{duration:g}"
+
+
+def extract_tokens(midi_path):
+    from music21 import converter, interval, pitch
+
+    score = converter.parse(str(midi_path))
+
+    if TRANSPOSE_TO_C:
+        try:
+            key = score.analyze("key")
+            target = pitch.Pitch("C" if key.mode == "major" else "A")
+            score = score.transpose(interval.Interval(key.tonic, target))
+        except Exception:
+            pass
+
+    elements = score.chordify().flatten().notes if USE_CHORDIFY else score.flatten().notes
+    tokens = []
+    for element in elements:
+        token = element_to_token(element)
+        if token:
+            tokens.append(token)
+        if len(tokens) >= MAX_TOKENS_PER_FILE:
+            break
+    return tokens
+
+
+def build_tokens():
+    files = find_midi_files(MIDI_DIR)
+    if not files:
+        raise FileNotFoundError(
+            f"No MIDI files in {MIDI_DIR}.\n"
+            "Copy some .mid files there, or run:  python music_ai.py demo-data")
+    all_tokens, used = [], 0
+    for i, path in enumerate(files, 1):
+        try:
+            tokens = extract_tokens(path)
+        except Exception as error:
+            print(f"[{i}/{len(files)}] SKIPPED {path.name}: {error}")
+            continue
+        if len(tokens) > SEQUENCE_LENGTH + 1:
+            all_tokens.extend(tokens)
+            used += 1
+            print(f"[{i}/{len(files)}] {path.name}: {len(tokens)} tokens")
+        else:
+            print(f"[{i}/{len(files)}] SKIPPED {path.name}: too short")
+    print(f"\nUsed {used} of {len(files)} files, {len(all_tokens)} tokens total.")
+    return all_tokens
+
+
+def load_or_build_tokens(force=False):
+    ensure_dirs()
+    if TOKENS_FILE.exists() and not force:
+        with open(TOKENS_FILE, "rb") as f:
+            tokens = pickle.load(f)
+        print(f"Loaded {len(tokens)} cached tokens.")
+        return tokens
+    tokens = build_tokens()
+    with open(TOKENS_FILE, "wb") as f:
+        pickle.dump(tokens, f)
+    return tokens
+
+
+def filter_rare(tokens):
+    counts = Counter(tokens)
+    return [t for t in tokens if counts[t] >= MIN_TOKEN_COUNT]
+
+
+def build_vocab(tokens):
+    token_to_int = {t: i for i, t in enumerate(sorted(set(tokens)))}
+    with open(VOCAB_FILE, "w", encoding="utf-8") as f:
+        json.dump({"token_to_int": token_to_int}, f)
+    return token_to_int
+
+
+def create_sequences(int_tokens):
+    """Sliding window: X = SEQUENCE_LENGTH tokens, y = the next token."""
+    X, y = [], []
+    for i in range(len(int_tokens) - SEQUENCE_LENGTH):
+        X.append(int_tokens[i: i + SEQUENCE_LENGTH])
+        y.append(int_tokens[i + SEQUENCE_LENGTH])
+    return np.array(X, dtype="int32"), np.array(y, dtype="int32")
+
+
+# =====================================================================
+# 3. MODEL (LSTM)
+# =====================================================================
+def build_model(vocab_size):
+    from tensorflow import keras
+    from tensorflow.keras import layers
+
+    inputs = keras.Input(shape=(SEQUENCE_LENGTH,), dtype="int32")
+    x = layers.Embedding(vocab_size, EMBED_DIM)(inputs)
+    x = layers.LSTM(LSTM_UNITS, return_sequences=True)(x)
+    x = layers.Dropout(DROPOUT)(x)
+    x = layers.LSTM(LSTM_UNITS)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(DROPOUT)(x)
+    x = layers.Dense(LSTM_UNITS, activation="relu")(x)
+    x = layers.Dropout(DROPOUT)(x)
+    outputs = layers.Dense(vocab_size, activation="softmax")(x)
+
+    model = keras.Model(inputs, outputs, name="music_lstm")
+    model.compile(
+        loss="sparse_categorical_crossentropy",
+        optimizer=keras.optimizers.Adam(LEARNING_RATE),
+        metrics=["accuracy"],
+    )
+    return model
+
+
+# =====================================================================
+# 4. TRAINING
+# =====================================================================
+def plot_history(history):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    for ax, metric in zip(axes, ("loss", "accuracy")):
+        ax.plot(history.history[metric], label="train")
+        ax.plot(history.history["val_" + metric], label="validation")
+        ax.set_title(metric.capitalize())
+        ax.set_xlabel("Epoch")
+        ax.legend()
+    fig.tight_layout()
+    fig.savefig(HISTORY_PLOT, dpi=120)
+    plt.close(fig)
+
+
+def train(args):
+    from tensorflow import keras
+
+    ensure_dirs()
+    np.random.seed(RANDOM_SEED)
+
+    tokens = filter_rare(load_or_build_tokens(force=args.force))
+    token_to_int = build_vocab(tokens)
+    vocab_size = len(token_to_int)
+    ints = [token_to_int[t] for t in tokens]
+    X, y = create_sequences(ints)
+
+    print(f"\nVocabulary size : {vocab_size}")
+    print(f"Training samples: {len(X)}")
+    if len(X) < 1000:
+        print("WARNING: very little data. Add more MIDI files for better music.")
+
+    order = np.random.permutation(len(X))
+    X, y = X[order], y[order]
+    n_val = int(len(X) * VALIDATION_SPLIT)
+    X_val, y_val, X_train, y_train = X[:n_val], y[:n_val], X[n_val:], y[n_val:]
+
+    model = build_model(vocab_size)
+    model.summary()
+
+    callbacks = [
+        keras.callbacks.ModelCheckpoint(str(BEST_MODEL_FILE), monitor="val_loss",
+                                        save_best_only=True, verbose=1),
+        keras.callbacks.EarlyStopping(monitor="val_loss", patience=6,
+                                      restore_best_weights=True, verbose=1),
+        keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                                          patience=3, min_lr=1e-5, verbose=1),
+    ]
+    history = model.fit(X_train, y_train, validation_data=(X_val, y_val),
+                        epochs=args.epochs, batch_size=args.batch_size,
+                        callbacks=callbacks)
+
+    model.save(str(MODEL_FILE))
+    plot_history(history)
+    print(f"\nModel saved     : {MODEL_FILE}")
+    print(f"Training plot   : {HISTORY_PLOT}")
+    print("Next step       : python music_ai.py generate --play")
+
+
+# =====================================================================
+# 5. GENERATION  (tokens -> MIDI -> audio)
+# =====================================================================
+def sample_next(probs, temperature=1.0, top_k=0):
+    """Pick next token. Low temperature = safe/repetitive, high = random."""
+    probs = np.asarray(probs, dtype="float64")
+    if temperature <= 0:
+        return int(np.argmax(probs))
+    logits = np.log(probs + 1e-9) / temperature
+    if top_k and top_k < len(logits):
+        cutoff = np.sort(logits)[-top_k]
+        logits[logits < cutoff] = -np.inf
+    logits -= logits.max()
+    p = np.exp(logits)
+    p /= p.sum()
+    return int(np.random.choice(len(p), p=p))
+
+
+def tokens_to_stream(tokens, bpm):
+    from music21 import chord, instrument, note, stream, tempo
+
+    music = stream.Stream()
+    music.insert(0, tempo.MetronomeMark(number=bpm))
+    music.insert(0, instrument.Piano())
+
+    offset = 0.0
+    for token in tokens:
+        name, duration = token.rsplit(":", 1)
+        duration = float(duration)
+        if re.fullmatch(r"[\d.]+", name):                     # chord like 60.64.67
+            element = chord.Chord([int(n) for n in name.split(".")])
+        else:                                                 # note like C#4
+            element = note.Note(name)
+        element.quarterLength = duration
+        music.insert(offset, element)
+        offset += duration
+    return music
+
+
+def midi_to_wav(midi_path, soundfont):
+    """Needs FluidSynth installed and a .sf2 soundfont file."""
+    try:
+        from midi2audio import FluidSynth
+    except ImportError:
+        print("Audio skipped: run  pip install midi2audio")
+        return None
+    if not soundfont or not Path(soundfont).exists():
+        print("Audio skipped: give a valid soundfont with  --soundfont file.sf2")
+        return None
+    wav_path = Path(midi_path).with_suffix(".wav")
+    try:
+        FluidSynth(str(soundfont)).midi_to_audio(str(midi_path), str(wav_path))
+    except Exception as error:
+        print(f"Audio conversion failed (is FluidSynth installed?): {error}")
+        return None
+    return wav_path
+
+
+def play_midi(midi_path):
+    try:
+        import pygame
+    except ImportError:
+        print("Playback skipped: run  pip install pygame")
+        return
+    pygame.mixer.init()
+    pygame.mixer.music.load(str(midi_path))
+    pygame.mixer.music.play()
+    print("Playing... press Ctrl+C to stop.")
+    try:
+        while pygame.mixer.music.get_busy():
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pygame.mixer.music.stop()
+
+
+def generate(args):
+    from tensorflow import keras
+
+    ensure_dirs()
+    model_path = Path(args.model)
+    if not model_path.exists():
+        raise FileNotFoundError(f"{model_path} not found. Run:  python music_ai.py train")
+    model = keras.models.load_model(str(model_path))
+
+    with open(VOCAB_FILE, encoding="utf-8") as f:
+        token_to_int = json.load(f)["token_to_int"]
+    int_to_token = {i: t for t, i in token_to_int.items()}
+    with open(TOKENS_FILE, "rb") as f:
+        ints = [token_to_int[t] for t in pickle.load(f) if t in token_to_int]
+
+    seq_len = model.input_shape[1]
+    if len(ints) <= seq_len + 1:
+        raise ValueError("Not enough training data to pick a seed.")
+
+    for n in range(1, args.count + 1):
+        start = random.randint(0, len(ints) - seq_len - 1)
+        pattern = list(ints[start: start + seq_len])           # random seed from the data
+
+        print(f"\nGenerating piece {n}/{args.count} "
+              f"(length={args.length}, temperature={args.temperature})...")
+        generated = []
+        for _ in range(args.length):
+            x = np.array(pattern, dtype="int32")[None, :]
+            probs = model(x, training=False).numpy()[0]
+            index = sample_next(probs, args.temperature, args.top_k)
+            generated.append(int_to_token[index])
+            pattern = pattern[1:] + [index]
+
+        music = tokens_to_stream(generated, args.bpm)
+        midi_path = OUTPUT_DIR / f"generated_{time.strftime('%Y%m%d_%H%M%S')}_{n}.mid"
+        music.write("midi", fp=str(midi_path))
+        print(f"Saved MIDI : {midi_path}")
+
+        if args.audio:
+            wav = midi_to_wav(midi_path, args.soundfont)
+            if wav:
+                print(f"Saved audio: {wav}")
+        if args.play:
+            play_midi(midi_path)
+
+
+# =====================================================================
+# COMMAND LINE
+# =====================================================================
+def main():
+    parser = argparse.ArgumentParser(description="Music generation with an LSTM")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("demo-data", help="create small test MIDI files")
+    p.add_argument("--files", type=int, default=30)
+
+    p = sub.add_parser("train", help="preprocess MIDI files and train the model")
+    p.add_argument("--epochs", type=int, default=EPOCHS)
+    p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    p.add_argument("--force", action="store_true", help="re-parse the MIDI files")
+
+    p = sub.add_parser("generate", help="generate new music")
+    p.add_argument("--model", default=str(MODEL_FILE))
+    p.add_argument("--length", type=int, default=DEFAULT_LENGTH)
+    p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+    p.add_argument("--top-k", type=int, default=0, help="0 = off")
+    p.add_argument("--bpm", type=int, default=DEFAULT_BPM)
+    p.add_argument("--count", type=int, default=1)
+    p.add_argument("--audio", action="store_true", help="also save a .wav file")
+    p.add_argument("--soundfont", default=None, help="path to a .sf2 soundfont")
+    p.add_argument("--play", action="store_true", help="play the result")
+
+    args = parser.parse_args()
+    if args.command == "demo-data":
+        make_demo_data(args.files)
+    elif args.command == "train":
+        train(args)
+    elif args.command == "generate":
+        generate(args)
+
+
+if __name__ == "__main__":
+    main()
